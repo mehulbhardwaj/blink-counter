@@ -42,6 +42,8 @@ class FaceAnalyzer:
         self.blink_cooldown_counter = 0
         self.is_eye_closed = False
         self.is_frowning = False
+        self.distance_alert_cooldown = 0
+        self.distance_alert_counter = 0
         
         # Initialize metrics
         self.metrics = {
@@ -53,6 +55,10 @@ class FaceAnalyzer:
         
         # Start time
         self.start_time = None
+        
+        # Add warning message timer
+        self.warning_timestamp = 0
+        self.WARNING_DURATION = 2  # seconds
 
     def calculate_eye_aspect_ratio(self, eye_points):
         """Calculate the eye aspect ratio for blink detection"""
@@ -105,12 +111,15 @@ class FaceAnalyzer:
         frame_metrics = {
             'blinks': 0,
             'distance': 0,
-            'frowning': False
+            'frowning': False,
+            'screen_distance_alert': 0
         }
         
         # Update cooldown counters
         if self.blink_cooldown_counter > 0:
             self.blink_cooldown_counter -= 1
+        if self.distance_alert_cooldown > 0:
+            self.distance_alert_cooldown -= 1
         
         # Process the largest face if multiple faces are detected
         if len(faces) > 0:
@@ -157,12 +166,19 @@ class FaceAnalyzer:
             else:
                 self.is_frowning = False
             
+            # Screen distance alert check
+            if frame_metrics['distance'] < 40 and self.distance_alert_cooldown == 0:
+                self.distance_alert_counter += 1
+                frame_metrics['screen_distance_alert'] = 1
+                self.distance_alert_cooldown = 50  # 10 seconds * 30 fps
+                self.warning_timestamp = time.time()  # Set warning start time
+            
             # Draw facial landmarks
             for point in points:
                 cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
             
             # Draw debug information
-            cv2.putText(frame, f"MAR: {mar:.2f}", (10, 120),
+            cv2.putText(frame, f"MAR: {mar:.2f}", (10, 150),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Calculate frame processing time
@@ -239,6 +255,14 @@ def main():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Frowns: {analyzer.frown_counter}", (10, 90),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Distance Alerts: {analyzer.distance_alert_counter}", (10, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Show warning text for 2 seconds after alert
+                current_time = time.time()
+                if current_time - analyzer.warning_timestamp < analyzer.WARNING_DURATION:
+                    cv2.putText(frame, "WARNING: Too Close to Screen!", (frame.shape[1]//4, frame.shape[0]//2),
+                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                 
                 # Display frame
                 cv2.imshow('Face Analysis', frame)
@@ -269,6 +293,7 @@ def main():
         logging.info(f"Total Frames Processed: {analyzer.frame_counter}")
         logging.info(f"Total Blinks Detected: {analyzer.blink_counter}")
         logging.info(f"Total Frowns Detected: {analyzer.frown_counter}")
+        logging.info(f"Total Distance Alerts: {analyzer.distance_alert_counter}")
 
 if __name__ == "__main__":
     main()
