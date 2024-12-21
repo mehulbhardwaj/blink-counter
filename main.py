@@ -12,7 +12,10 @@ import logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='face_analysis.log'
+    handlers=[
+        logging.FileHandler('face_analysis.log', mode='a', delay=False),  # Set delay to False for real-time logging
+        logging.StreamHandler()  # Optional: also log to console
+    ]
 )
 
 class FaceAnalyzer:
@@ -93,8 +96,8 @@ class FaceAnalyzer:
         """Process a single frame and return analyzed metrics"""
         frame_start = time.time()
         
-        # Convert frame to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Convert frame to grayscale for faster processing
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Keep original resolution
         
         # Detect faces
         faces = self.detector(gray, 0)
@@ -167,6 +170,30 @@ class FaceAnalyzer:
         self.frame_times.append(frame_time)
         
         return frame, frame_metrics
+    
+    
+    def update_performance_metrics(self):
+        """Update CPU, memory, and FPS metrics"""
+        # Log metrics every 10 seconds instead of every 5 seconds
+        if time.time() - self.start_time >= 5:
+            cpu_percent = psutil.cpu_percent()
+            memory_percent = psutil.Process().memory_percent()
+            
+            if self.frame_times:
+                current_fps = 1.0 / np.mean(self.frame_times)
+                current_latency = np.mean(self.frame_times) * 1000  # Convert to ms
+            else:
+                current_fps = 0
+                current_latency = 0
+            
+            self.metrics['cpu_usage'].append(cpu_percent)
+            self.metrics['memory_usage'].append(memory_percent)
+            self.metrics['fps'].append(current_fps)
+            self.metrics['latency'].append(current_latency)
+            
+            logging.info(f"CPU: {cpu_percent:.1f}% | Memory: {memory_percent:.1f}% | "
+                        f"FPS: {current_fps:.1f} | Latency: {current_latency:.1f}ms")
+            self.start_time = time.time()  # Reset start time for next logging interval
 
 def main():
     # Initialize video capture
@@ -187,28 +214,34 @@ def main():
     metrics_thread = threading.Thread(target=metrics_monitor)
     metrics_thread.start()
     
+    frame_count = 0  # Initialize frame counter
+
     try:
         while time.time() - analyzer.start_time < 120:  # Run for 2 minutes
             ret, frame = cap.read()
             if not ret:
                 break
             
-            # Process frame
-            frame, metrics = analyzer.process_frame(frame)
+            frame_count += 1  # Increment frame counter
             
-            # Update frame counter
-            analyzer.frame_counter += 1
-            
-            # Display metrics on frame
-            cv2.putText(frame, f"Blinks: {analyzer.blink_counter}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Distance: {metrics['distance']:.1f}cm", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Frowns: {analyzer.frown_counter}", (10, 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Display frame
-            cv2.imshow('Face Analysis', frame)
+            # Process every 5th frame instead of every 3rd
+            if frame_count % 5 == 0:
+                # Process frame
+                frame, metrics = analyzer.process_frame(frame)
+                
+                # Update frame counter
+                analyzer.frame_counter += 1
+                
+                # Display metrics on frame
+                cv2.putText(frame, f"Blinks: {analyzer.blink_counter}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Distance: {metrics['distance']:.1f}cm", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Frowns: {analyzer.frown_counter}", (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Display frame
+                cv2.imshow('Face Analysis', frame)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
