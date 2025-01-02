@@ -42,7 +42,7 @@ Ensure you have the following installed on your system:
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/FaceAnalysis.git
+   git clone https://github.com/mehulbhardwaj/blink-counter.git
    cd face-analysis-system
    ```
 
