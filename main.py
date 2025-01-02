@@ -1,299 +1,201 @@
 import cv2
-import dlib
-import numpy as np
 import time
-from scipy.spatial import distance
-import psutil
-import threading
-from collections import deque
+import signal
+import sys
 import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('face_analysis.log', mode='a', delay=False),  # Set delay to False for real-time logging
-        logging.StreamHandler()  # Optional: also log to console
-    ]
+from face_analyzer import (
+    FaceAnalyzer,
+    find_working_camera,
+    configure_logging,
+    signal_handler,
+    setup_signal_handler
 )
+from face_analyzer.config import FRAME_WIDTH, FRAME_HEIGHT, FPS
+from threading import Thread
+from face_analyzer.monitoring import metrics_monitor
+import psutil
+from collections import deque
+import numpy as np
 
-class FaceAnalyzer:
-    def __init__(self):
-        # Initialize face detector and facial landmarks predictor
-        self.detector = dlib.get_frontal_face_detector()
-        self.predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
-        
-        # Constants for blink detection
-        self.EYE_AR_THRESH = 0.25
-        self.EYE_AR_CONSEC_FRAMES = 3
-        self.BLINK_COOLDOWN = 10  # frames to wait before detecting next blink
-        
-        # Constants for frown detection
-        self.MOUTH_AR_THRESH = 0.2  # Threshold for mouth aspect ratio
-        
-        # Performance monitoring
-        self.frame_times = deque(maxlen=30)
-        self.blink_counter = 0
-        self.frame_counter = 0
-        self.frown_counter = 0
-        
-        # State tracking
-        self.blink_cooldown_counter = 0
-        self.is_eye_closed = False
-        self.is_frowning = False
-        self.distance_alert_cooldown = 0
-        self.distance_alert_counter = 0
-        
-        # Initialize metrics
-        self.metrics = {
-            'cpu_usage': [],
-            'memory_usage': [],
-            'fps': [],
-            'latency': []
-        }
-        
-        # Start time
-        self.start_time = None
-        
-        # Add warning message timer
-        self.warning_timestamp = 0
-        self.WARNING_DURATION = 2  # seconds
-
-    def calculate_eye_aspect_ratio(self, eye_points):
-        """Calculate the eye aspect ratio for blink detection"""
-        # Compute vertical distances
-        A = distance.euclidean(eye_points[1], eye_points[5])
-        B = distance.euclidean(eye_points[2], eye_points[4])
-        
-        # Compute horizontal distance
-        C = distance.euclidean(eye_points[0], eye_points[3])
-        
-        # Calculate eye aspect ratio
-        ear = (A + B) / (2.0 * C)
-        return ear
-
-    def calculate_mouth_aspect_ratio(self, mouth_points):
-        """Calculate the mouth aspect ratio for frown detection"""
-        # Compute vertical distances between outer mouth points
-        A = distance.euclidean(mouth_points[3], mouth_points[9])  # Upper to lower middle point
-        
-        # Compute horizontal distance between mouth corners
-        C = distance.euclidean(mouth_points[0], mouth_points[6])  # Corner to corner
-        
-        # Calculate mouth aspect ratio
-        mar = A / C
-        return mar
-
-    def estimate_distance(self, face_width_pixels):
-        """Estimate distance from camera based on face width"""
-        # Constants for distance estimation (calibrated for typical webcam)
-        KNOWN_DISTANCE = 60.0  # cm
-        KNOWN_WIDTH = 16.0    # cm (average face width)
-        KNOWN_WIDTH_PIXELS = 250  # pixels at KNOWN_DISTANCE
-        
-        # Calculate distance using triangle similarity
-        distance = (KNOWN_WIDTH * KNOWN_DISTANCE * KNOWN_WIDTH_PIXELS) / (face_width_pixels * KNOWN_WIDTH)
-        
-        # Apply smoothing and bounds
-        return max(20, min(200, distance))
-
-    def process_frame(self, frame):
-        """Process a single frame and return analyzed metrics"""
-        frame_start = time.time()
-        
-        # Convert frame to grayscale for faster processing
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Keep original resolution
-        
-        # Detect faces
-        faces = self.detector(gray, 0)
-        
-        frame_metrics = {
-            'blinks': 0,
-            'distance': 0,
-            'frowning': False,
-            'screen_distance_alert': 0
-        }
-        
-        # Update cooldown counters
-        if self.blink_cooldown_counter > 0:
-            self.blink_cooldown_counter -= 1
-        if self.distance_alert_cooldown > 0:
-            self.distance_alert_cooldown -= 1
-        
-        # Process the largest face if multiple faces are detected
-        if len(faces) > 0:
-            face = max(faces, key=lambda rect: (rect.right() - rect.left()) * (rect.bottom() - rect.top()))
-            
-            # Get facial landmarks
-            landmarks = self.predictor(gray, face)
-            points = np.array([[p.x, p.y] for p in landmarks.parts()])
-            
-            # Extract eye coordinates
-            left_eye = points[42:48]
-            right_eye = points[36:42]
-            
-            # Calculate eye aspect ratios
-            left_ear = self.calculate_eye_aspect_ratio(left_eye)
-            right_ear = self.calculate_eye_aspect_ratio(right_eye)
-            ear = (left_ear + right_ear) / 2.0
-            
-            # Blink detection with cooldown
-            if ear < self.EYE_AR_THRESH and not self.is_eye_closed and self.blink_cooldown_counter == 0:
-                self.is_eye_closed = True
-                self.blink_counter += 1
-                self.blink_cooldown_counter = self.BLINK_COOLDOWN
-                frame_metrics['blinks'] = 1
-            elif ear >= self.EYE_AR_THRESH:
-                self.is_eye_closed = False
-            
-            # Calculate face width and estimate distance
-            face_width = face.right() - face.left()
-            frame_metrics['distance'] = self.estimate_distance(face_width)
-            
-            # Extract mouth points for frown detection (outer mouth points)
-            mouth_points = points[48:60]
-            
-            # Calculate mouth aspect ratio
-            mar = self.calculate_mouth_aspect_ratio(mouth_points)
-            
-            # Frown detection without cooldown
-            if mar > self.MOUTH_AR_THRESH:
-                if not self.is_frowning:
-                    self.is_frowning = True
-                    self.frown_counter += 1
-                    frame_metrics['frowning'] = True
-            else:
-                self.is_frowning = False
-            
-            # Screen distance alert check
-            if frame_metrics['distance'] < 40 and self.distance_alert_cooldown == 0:
-                self.distance_alert_counter += 1
-                frame_metrics['screen_distance_alert'] = 1
-                self.distance_alert_cooldown = 50  # 10 seconds * 30 fps
-                self.warning_timestamp = time.time()  # Set warning start time
-            
-            # Draw facial landmarks
-            for point in points:
-                cv2.circle(frame, tuple(point), 2, (0, 255, 0), -1)
-            
-            # Draw debug information
-            cv2.putText(frame, f"MAR: {mar:.2f}", (10, 150),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Calculate frame processing time
-        frame_time = time.time() - frame_start
-        self.frame_times.append(frame_time)
-        
-        return frame, frame_metrics
-    
-    
-    def update_performance_metrics(self):
-        """Update CPU, memory, and FPS metrics"""
-        # Log metrics every 10 seconds instead of every 5 seconds
-        if time.time() - self.start_time >= 5:
-            cpu_percent = psutil.cpu_percent()
-            memory_percent = psutil.Process().memory_percent()
-            
-            if self.frame_times:
-                current_fps = 1.0 / np.mean(self.frame_times)
-                current_latency = np.mean(self.frame_times) * 1000  # Convert to ms
-            else:
-                current_fps = 0
-                current_latency = 0
-            
-            self.metrics['cpu_usage'].append(cpu_percent)
-            self.metrics['memory_usage'].append(memory_percent)
-            self.metrics['fps'].append(current_fps)
-            self.metrics['latency'].append(current_latency)
-            
-            logging.info(f"CPU: {cpu_percent:.1f}% | Memory: {memory_percent:.1f}% | "
-                        f"FPS: {current_fps:.1f} | Latency: {current_latency:.1f}ms")
-            self.start_time = time.time()  # Reset start time for next logging interval
 
 def main():
-    # Initialize video capture
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    
+    configure_logging()
+
+    # Initialize video capture with working camera
+    camera_index = find_working_camera()
+    cap = cv2.VideoCapture(camera_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    # Verify camera is working properly
+    if not cap.isOpened():
+        logging.error("Error: Camera not accessible")
+        return
+
+    # Attach signal handler for graceful exit
+    setup_signal_handler(cap)
+
     analyzer = FaceAnalyzer()
     analyzer.start_time = time.time()
-    
+
     # Start metrics monitoring thread
-    def metrics_monitor():
-        while time.time() - analyzer.start_time < 120:  # Run for 2 minutes
-            analyzer.update_performance_metrics()
-            time.sleep(1)
-    
-    metrics_thread = threading.Thread(target=metrics_monitor)
+    metrics_thread = Thread(target=metrics_monitor, args=(analyzer,))
+    metrics_thread.daemon = True  # Make thread daemon so it exits with main program
     metrics_thread.start()
-    
-    frame_count = 0  # Initialize frame counter
+
+    cpu_readings = deque(maxlen=30)  # Store last 30 readings (1 second at 30 FPS)
 
     try:
-        while time.time() - analyzer.start_time < 120:  # Run for 2 minutes
+        frame_count = 0
+        fps_start_time = time.time()
+        fps = 0
+        
+        while True:
+            # Capture frame-by-frame
             ret, frame = cap.read()
             if not ret:
+                logging.warning("Failed to capture frame. Exiting...")
                 break
+
+            frame_count += 1
+            current_time = time.time()
             
-            frame_count += 1  # Increment frame counter
+            # Calculate FPS
+            if current_time - fps_start_time >= 1.0:
+                fps = frame_count / (current_time - fps_start_time)
+                frame_count = 0
+                fps_start_time = current_time
+
+            # Process frame and get metrics
+            processed_frame, metrics = analyzer.process_frame(frame)
+
+            # Calculate positions and dimensions for overlays
+            frame_width = processed_frame.shape[1]
+            frame_height = processed_frame.shape[0]
+            metrics_padding = 20
+            line_height = 30
+
+            # Add semi-transparent background for top-left metrics
+            metrics_overlay = processed_frame.copy()
+            cv2.rectangle(metrics_overlay,
+                         (metrics_padding, metrics_padding),
+                         (300, 150),
+                         (0, 0, 0),
+                         -1)
+            cv2.addWeighted(metrics_overlay, 0.3, processed_frame, 0.7, 0, processed_frame)
+
+            # Display metrics overlay on top-left with white text
+            cv2.putText(processed_frame, f"FPS: {fps:.1f}", 
+                       (metrics_padding + 10, metrics_padding + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(processed_frame, f"Blinks: {analyzer.blink_counter}", 
+                       (metrics_padding + 10, metrics_padding + 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if 'distance' in metrics:
+                cv2.putText(processed_frame, f"Distance: {metrics['distance']:.1f}cm", 
+                           (metrics_padding + 10, metrics_padding + 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(processed_frame, f"Frowns: {analyzer.frown_counter}", 
+                       (metrics_padding + 10, metrics_padding + 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Display system metrics on bottom-right
+            runtime = time.time() - analyzer.start_time
+            current_cpu = psutil.cpu_percent()
+            cpu_readings.append(current_cpu)
+            avg_cpu = np.mean(cpu_readings) if cpu_readings else current_cpu
+            memory_usage = psutil.Process().memory_percent()
             
-            # Process every 5th frame instead of every 3rd
-            if frame_count % 5 == 0:
-                # Process frame
-                frame, metrics = analyzer.process_frame(frame)
-                
-                # Update frame counter
-                analyzer.frame_counter += 1
-                
-                # Display metrics on frame
-                cv2.putText(frame, f"Blinks: {analyzer.blink_counter}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Distance: {metrics['distance']:.1f}cm", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Frowns: {analyzer.frown_counter}", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Distance Alerts: {analyzer.distance_alert_counter}", (10, 120),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Show warning text for 2 seconds after alert
-                current_time = time.time()
-                if current_time - analyzer.warning_timestamp < analyzer.WARNING_DURATION:
-                    cv2.putText(frame, "WARNING: Too Close to Screen!", (frame.shape[1]//4, frame.shape[0]//2),
-                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                
-                # Display frame
-                cv2.imshow('Face Analysis', frame)
+            # Add semi-transparent background for bottom-right metrics and quit button
+            metrics_overlay = processed_frame.copy()
+            cv2.rectangle(metrics_overlay,
+                         (frame_width - 300, frame_height - 190),  # Increased height for button spacing
+                         (frame_width - metrics_padding, frame_height - metrics_padding),
+                         (0, 0, 0),
+                         -1)
+            cv2.addWeighted(metrics_overlay, 0.3, processed_frame, 0.7, 0, processed_frame)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Add system metrics text
+            text_x = frame_width - 290  # Left alignment position
+            cv2.putText(processed_frame, 
+                       f"Runtime: {int(runtime//3600):02d}:{int((runtime%3600)//60):02d}:{int(runtime%60):02d}",
+                       (text_x, frame_height - 160),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(processed_frame,
+                       f"CPU: {avg_cpu:.1f}%",
+                       (text_x, frame_height - 130),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(processed_frame,
+                       f"Memory: {memory_usage:.1f}%",
+                       (text_x, frame_height - 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Add quit button aligned with text
+            button_width = 100
+            button_height = 30
+            button_x = text_x  # Align with text
+            button_y = frame_height - 80  # Position below the last text line
+            
+            # Create deep red quit button with shadow
+            button_overlay = processed_frame.copy()
+            # Shadow
+            cv2.rectangle(processed_frame,
+                         (button_x + 2, button_y + 2),
+                         (button_x + button_width + 2, button_y + button_height + 2),
+                         (0, 0, 0),
+                         -1)
+            # Button
+            cv2.rectangle(button_overlay,
+                         (button_x, button_y),
+                         (button_x + button_width, button_y + button_height),
+                         (139, 0, 0),  # Deep red color
+                         -1)
+            cv2.addWeighted(button_overlay, 0.9, processed_frame, 0.1, 0, processed_frame)
+            
+            # Add white text to button
+            cv2.putText(processed_frame, 
+                       "QUIT",
+                       (button_x + 25, button_y + 22),
+                       cv2.FONT_HERSHEY_SIMPLEX,
+                       0.7,
+                       (255, 255, 255),
+                       2)
+
+            # Update the mouse callback coordinates for the new button position
+            quit_button = (button_x, button_y, button_width, button_height)
+
+            # Show warning for close distance
+            if metrics.get('screen_distance_alert'):
+                cv2.putText(processed_frame, "WARNING: Too Close to Screen!", 
+                           (frame_width//4, frame_height//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            # Display the frame
+            cv2.imshow('Face Analysis', processed_frame)
+
+            # Handle mouse clicks for quit button
+            def mouse_callback(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    if (quit_button[0] <= x <= quit_button[0] + quit_button[2] and 
+                        quit_button[1] <= y <= quit_button[1] + quit_button[3]):
+                        analyzer.log_final_statistics()
+                        cap.release()
+                        cv2.destroyAllWindows()
+                        sys.exit(0)
+
+            cv2.setMouseCallback('Face Analysis', mouse_callback)
+
+            # Check for keyboard interrupt (q key)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
-    
+
     finally:
-        # Clean up
+        analyzer.log_final_statistics()
         cap.release()
         cv2.destroyAllWindows()
-        
-        # Calculate and log final statistics
-        avg_cpu = np.mean(analyzer.metrics['cpu_usage'])
-        peak_cpu = max(analyzer.metrics['cpu_usage'])
-        avg_memory = np.mean(analyzer.metrics['memory_usage'])
-        peak_memory = max(analyzer.metrics['memory_usage'])
-        avg_fps = np.mean(analyzer.metrics['fps'])
-        avg_latency = np.mean(analyzer.metrics['latency'])
-        
-        logging.info("\n=== Final Statistics ===")
-        logging.info(f"Average CPU Usage: {avg_cpu:.1f}%")
-        logging.info(f"Peak CPU Usage: {peak_cpu:.1f}%")
-        logging.info(f"Average Memory Usage: {avg_memory:.1f}%")
-        logging.info(f"Peak Memory Usage: {peak_memory:.1f}%")
-        logging.info(f"Average FPS: {avg_fps:.1f}")
-        logging.info(f"Average Latency: {avg_latency:.1f}ms")
-        logging.info(f"Total Frames Processed: {analyzer.frame_counter}")
-        logging.info(f"Total Blinks Detected: {analyzer.blink_counter}")
-        logging.info(f"Total Frowns Detected: {analyzer.frown_counter}")
-        logging.info(f"Total Distance Alerts: {analyzer.distance_alert_counter}")
+
 
 if __name__ == "__main__":
     main()
